@@ -214,9 +214,12 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
-            visualization_dump["depth"] = rearrange(
-                depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            )
+            try:
+                visualization_dump["depth"] = rearrange(
+                    depths, "b v (h w) srf s -> b v h w srf s", h=h, w=w
+                )
+            except:
+                pass
             visualization_dump["scales"] = rearrange(
                 gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
             )
