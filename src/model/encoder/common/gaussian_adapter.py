@@ -66,6 +66,13 @@ class GaussianAdapter(nn.Module):
         h, w = image_shape
         pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
         multiplier = self.get_scale_multiplier(intrinsics, pixel_size)
+
+        # NOTE: take depth from camera coords = inv(extrinsic) @ world_coords 
+        # world_coords_h = homogenize_points(world_coords)
+        # camera_coords_h = transform_world2cam(world_coords_h, extrinsics)
+        # camera_coords = camera_coords_h[..., :-1]
+        # depths = camera_coords[..., -1]
+
         scales = scales * depths[..., None] * multiplier[..., None]
 
         # Normalize the quaternion features to yield a valid quaternion.
@@ -83,6 +90,13 @@ class GaussianAdapter(nn.Module):
         # Compute Gaussian means.
         origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
         means = origins + directions * depths[..., None]
+
+        # print('means', means.shape)             # [1, 2, 65536, 1, 1, 3]
+        # print('covariances', covariances.shape) # [1, 2, 65536, 1, 1, 3, 3]
+        # print('sh', sh.shape)                   # [1, 2, 65536, 1, 1, 3, _]
+        # print('opacities', opacities.shape)     # [1, 2, 65536, 1, 1]
+        # print('scales', scales.shape)           # [1, 2, 65536, 1, 1, 3]
+        # print('rotations', rotations.shape)     # [1, 2, 65536, 1, 1, 4]
 
         return Gaussians(
             means=means,

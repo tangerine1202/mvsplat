@@ -6,6 +6,11 @@ from einops import rearrange, repeat
 from ..backbone.unimatch.geometry import coords_grid
 from .ldm_unet.unet import UNetModel
 
+from ....geometry.projection import (
+    homogenize_points, 
+    transform_world2cam,
+)
+
 
 def warp_with_pose_depth_candidates(
     feature1,
@@ -16,6 +21,10 @@ def warp_with_pose_depth_candidates(
     warp_padding_mode="zeros",
 ):
     """
+    Project 3D points (generated from unprojection and depth candidates) in feat0 (ref) to feat1 (tgt) image plane,
+    and sample corresponding features on feat1.
+    This constructs the cost volume viewing from feat0 (ref) with feat1 (tgt) features.
+
     feature1: [B, C, H, W]
     intrinsics: [B, 3, 3]
     pose: [B, 4, 4]
@@ -36,6 +45,7 @@ def warp_with_pose_depth_candidates(
         )  # [B, 3, H, W]
         # back project to 3D and transform viewpoint
         points = torch.inverse(intrinsics).bmm(grid.view(b, 3, -1))  # [B, 3, H*W]
+        # NOTE: every point is sampled D candidates times to construct the cost volume
         points = torch.bmm(pose[:, :3, :3], points).unsqueeze(2).repeat(
             1, 1, d, 1
         ) * depth.view(
@@ -58,7 +68,7 @@ def warp_with_pose_depth_candidates(
 
     # sample features
     warped_feature = F.grid_sample(
-        feature1,
+        feature1,  # [B, C, H, W]
         grid.view(b, d * h, w, 2),
         mode="bilinear",
         padding_mode=warp_padding_mode,
@@ -71,8 +81,21 @@ def warp_with_pose_depth_candidates(
 
 
 def prepare_feat_proj_data_lists(
-    features, intrinsics, extrinsics, near, far, num_samples
+    features,
+    intrinsics,
+    extrinsics,
+    near,
+    far,
+    num_samples
 ):
+    """
+    features   : [B, V, C, H, W]
+    intrinsics : [B, V, 3, 3]
+    extrinsics : [B, V, 4, 4]
+    near       : [B, V]
+    far        : [B, V]
+    num_samples
+    """
     # prepare features
     b, v, _, h, w = features.shape
 
@@ -84,6 +107,7 @@ def prepare_feat_proj_data_lists(
         cur_view_order = init_view_order[idx:] + init_view_order[:idx]
         cur_feat = features[:, cur_view_order]
         feat_lists.append(rearrange(cur_feat, "b v ... -> (v b) ..."))  # (vxb c h w)
+        # NOTE: the current view is put at index 0
 
         # calculate reference pose
         # NOTE: not efficient, but clearer for now
@@ -96,14 +120,14 @@ def prepare_feat_proj_data_lists(
                 )
             cur_ref_pose_to_v0s = torch.cat(cur_ref_pose_to_v0_list, dim=0)  # (vxb c h w)
             pose_curr_lists.append(cur_ref_pose_to_v0s)
-    
+
     # get 2 views reference pose
     # NOTE: do it in such a way to reproduce the exact same value as reported in paper
     if v == 2:
         pose_ref = extrinsics[:, 0].clone().detach()
         pose_tgt = extrinsics[:, 1].clone().detach()
-        pose = pose_tgt.inverse() @ pose_ref
-        pose_curr_lists = [torch.cat((pose, pose.inverse()), dim=0),]
+        pose = pose_tgt.inverse() @ pose_ref  
+        pose_curr_lists = [torch.cat((pose, pose.inverse()), dim=0),] # NOTE: transform to another view
 
     # unnormalized camera intrinsic
     intr_curr = intrinsics[:, :, :3, :3].clone().detach()  # [b, v, 3, 3]
@@ -196,6 +220,15 @@ class DepthPredictorMultiView(nn.Module):
             nn.GELU(),
             nn.Conv2d(num_depth_candidates * 2, num_depth_candidates, 3, 1, 1),
         )
+        # 3D coordinate estimation
+        self.coord_channels = 3
+        self.coords_head_lowres = nn.Sequential(
+            nn.Conv2d(num_depth_candidates, num_depth_candidates * 2, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(
+                num_depth_candidates * 2, num_depth_candidates * self.coord_channels, 3, 1, 1
+            ),
+        )
 
         # CNN-based feature upsampler
         proj_in_channels = feature_channels + feature_channels
@@ -214,7 +247,8 @@ class DepthPredictorMultiView(nn.Module):
         )
 
         # Depth refinement: 2D U-Net
-        input_channels = 3 + depth_unet_feat_dim + 1 + 1
+        # input_channels = 3 + depth_unet_feat_dim + 1 + 1
+        input_channels = 3 + depth_unet_feat_dim + self.coord_channels + self.coord_channels
         channels = depth_unet_feat_dim
         if wo_depth_refine:  # for ablations
             self.refine_unet = nn.Conv2d(input_channels, channels, 3, 1, 1)
@@ -290,7 +324,7 @@ class DepthPredictorMultiView(nn.Module):
             cnn_features = rearrange(cnn_features, "b v ... -> (v b) ...")
 
         # cost volume constructions
-        feat01 = feat_comb_lists[0]
+        feat01 = feat_comb_lists[0]  # [VxB, C, H, W]
         if self.wo_cost_volume:
             raw_correlation_in = feat01
         else:
@@ -327,14 +361,21 @@ class DepthPredictorMultiView(nn.Module):
                 raw_correlation_in
             )
 
-        # softmax to get coarse depth and density
+        # D candidates for each coordinate
         pdf = F.softmax(
-            self.depth_head_lowres(raw_correlation), dim=1
-        )  # [2xB, D, H, W]
-        coarse_disps = (disp_candi_curr * pdf).sum(
-            dim=1, keepdim=True
-        )  # (vb, 1, h, w)
-        pdf_max = torch.max(pdf, dim=1, keepdim=True)[0]  # argmax
+            rearrange(
+                self.coords_head_lowres(raw_correlation), # [2xB, D*3, H, W]
+                "b (d coord) h w -> b coord d h w", 
+                d=self.num_depth_candidates, 
+                coord=self.coord_channels,
+            ),
+            dim=2
+        ) # [2xB, 3, D, H, W]
+        # FIXME: should x, y axis be sampled linearly? since only depth has the preference for close values
+        coarse_disps = (disp_candi_curr[:, None] * pdf).sum(
+            dim=2, keepdim=False
+        )  # (vb, 3, h, w)
+        pdf_max = torch.max(pdf, dim=2, keepdim=False)[0]  # argmax
         pdf_max = F.interpolate(pdf_max, scale_factor=self.upscale_factor)
         fullres_disps = F.interpolate(
             coarse_disps,
@@ -359,49 +400,93 @@ class DepthPredictorMultiView(nn.Module):
             raw_gaussians, "(v b) c h w -> b v (h w) c", v=v, b=b
         )
 
-        if self.wo_depth_refine:
-            densities = repeat(
-                pdf_max,
-                "(v b) dpt h w -> b v (h w) srf dpt",
-                b=b,
-                v=v,
-                srf=1,
-            )
-            depths = 1.0 / fullres_disps
-            depths = repeat(
-                depths,
-                "(v b) dpt h w -> b v (h w) srf dpt",
-                b=b,
-                v=v,
-                srf=1,
-            )
-        else:
-            # delta fine depth and density
-            delta_disps_density = self.to_disparity(refine_out)
-            delta_disps, raw_densities = delta_disps_density.split(
-                gaussians_per_pixel, dim=1
-            )
 
-            # combine coarse and fine info and match shape
-            densities = repeat(
-                F.sigmoid(raw_densities),
-                "(v b) dpt h w -> b v (h w) srf dpt",
-                b=b,
-                v=v,
-                srf=1,
-            )
+        # FIXME: I think poses are concat in BxV order, not VxB as other data,
+        #        so it should not generalize to batch size > 2 or view > 2.
+        assert b == 1, "batch size > 1 is not supported"
+        assert v == 2, "view size > 2 is not supported"
+        poses = torch.cat(pose_curr_lists, dim=0)[:, None] # [BxV (or VxB), 1, 4, 4]
 
-            fine_disps = (fullres_disps + delta_disps).clamp(
-                1.0 / rearrange(far, "b v -> (v b) () () ()"),
-                1.0 / rearrange(near, "b v -> (v b) () () ()"),
-            )
-            depths = 1.0 / fine_disps
-            depths = repeat(
-                depths,
-                "(v b) dpt h w -> b v (h w) srf dpt",
-                b=b,
-                v=v,
-                srf=1,
-            )
+        # TODO: go with depth refine
+        # Depth in camera space
+        world_coords = 1.0 / fullres_disps # [vb 3 h w]
+        world_coords = rearrange(
+            world_coords,
+            "vb coord h w -> vb (h w) coord"
+        )
+        world_coords_h = homogenize_points(world_coords)
+        camera_coords = transform_world2cam(world_coords_h, poses)[..., :-1]
+        depths = camera_coords[..., -1:]
+        depths = repeat(
+            depths,
+            "(v b) hw coord -> b v hw srf coord",
+            b=b,
+            v=v,
+            srf=1,
+        )
 
-        return depths, densities, raw_gaussians
+        # Density in camera space
+        world_pdf_max = rearrange(
+            pdf_max,
+            "vb coord h w -> vb (h w) coord"
+        )
+        world_pdf_max_h = homogenize_points(world_pdf_max)
+        camera_pdf_max = transform_world2cam(world_pdf_max_h, poses)[..., :-1]
+        camera_densities = camera_pdf_max[..., -1:]
+        camera_densities = repeat(
+            camera_densities,
+            "(v b) hw coord -> b v hw srf coord",
+            b=b,
+            v=v,
+            srf=1,
+        )
+
+        return depths, camera_densities, raw_gaussians
+
+        # if self.wo_depth_refine:
+        # densities = repeat(
+        #     pdf_max,
+        #     "(v b) dpt h w -> b v (h w) srf dpt",
+        #     b=b,
+        #     v=v,
+        #     srf=1,
+        # )
+        # depths = 1.0 / fullres_disps
+        # depths = repeat(
+        #     depths,
+        #     "(v b) dpt h w -> b v (h w) srf dpt",
+        #     b=b,
+        #     v=v,
+        #     srf=1,
+        # )
+
+        # else:
+        #     # delta fine depth and density
+        #     delta_disps_density = self.to_disparity(refine_out)
+        #     delta_disps, raw_densities = delta_disps_density.split(
+        #         gaussians_per_pixel, dim=1
+        #     )
+
+        #     # combine coarse and fine info and match shape
+        #     densities = repeat(
+        #         F.sigmoid(raw_densities),
+        #         "(v b) dpt h w -> b v (h w) srf dpt",
+        #         b=b,
+        #         v=v,
+        #         srf=1,
+        #     )
+
+        #     fine_disps = (fullres_disps + delta_disps).clamp(
+        #         1.0 / rearrange(far, "b v -> (v b) () () ()"),
+        #         1.0 / rearrange(near, "b v -> (v b) () () ()"),
+        #     )
+        #     depths = 1.0 / fine_disps
+        #     depths = repeat(
+        #         depths,
+        #         "(v b) dpt h w -> b v (h w) srf dpt",
+        #         b=b,
+        #         v=v,
+        #         srf=1,
+        #     )
+
+        # return depths, densities, raw_gaussians
